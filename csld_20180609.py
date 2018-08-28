@@ -11,6 +11,7 @@ import scipy as sp
 import scipy.linalg
 from sympy import Matrix
 from numpy.linalg import svd
+from scipy.linalg import null_space
 import os
 import copy
 import itertools
@@ -242,7 +243,7 @@ def generating_sensing_mtx(N_atoms, clusters, poscar):
                 temp_block = np.dot(temp_block, kron(cluster.point, orbit[0].size))* (-1. / cluster_factorial(cluster))
                 sensing_mtx_block += temp_block
         A = np.hstack((A, sensing_mtx_block))
-    return A
+    return A[:,1:]
 
 def normalize_sensing_mtx(A, clusters):
     B = copy.deepcopy(A)
@@ -256,16 +257,16 @@ def normalize_sensing_mtx(A, clusters):
     max_list = []
     for i in range(len(temp)):
         if i == 0:
-            start_column = 1
-            end_column = (temp[i+1]-temp[i])*3**(i+2)+1
+            start_column = 0
+            end_column = (temp[i+1]-temp[i])*3**(i+2)
                
         if i == len(temp) - 1:
-            start_column = 1
+            start_column = 0
             for j in range(len(temp[:i])):
                 start_column += (temp[j+1]-temp[j])*3**(j+2)
             end_column = B.shape[1]
         else:
-            start_column = 1
+            start_column = 0
             for j in range(len(temp[:i])):
                 start_column += (temp[j+1]-temp[j])*3**(j+2)
             end_column = start_column + (temp[i+1]-temp[i])*3**(i+2)
@@ -322,26 +323,106 @@ def generating_improper_cluster_constraint(index):
                 break
     return constraint_block
     
-def position_in_clusters(cluster, clusters):
-    
-    
-    
+def position_in_clusters(orbit, clusters):
+    if clusters.index(orbit) == 0:
+        position = 0
+    else:
+        position = 0
+        for i in clusters[:clusters.index(orbit)]:
+            position += np.power(3, i[0].size)
     return position
 
+def gen_clus_component_repermutation_mtx(index, n):
+    '''
+    Return a matrix R satisfying R \Phi(b,a) = \Phi(a,b) when n=1
+                                 R \phi(b,c,a) = \Phi(a,c,b) when n=2
+                                 ...
+    This function is for the convenience of ASR.  
+    Here index means cluster.index                           
+    '''
+    size = len(index)
+    R = np.zeros([np.power(3, size), np.power(3, size)])
+    temp = []
+    for i,j in enumerate(itertools.product(['x', 'y', 'z'], repeat=size)):
+        temp.append(j)
+    for row in range(np.power(3, size)):
+        for i,j in enumerate(temp):
+            temp_list = list(j)
+            temp_list[0], temp_list[n] = temp_list[n], temp_list[0]
+            if tuple(temp_list) == temp[row]:
+                R[row, i] = 1
+                break
+    return R
+        
+        
 
-def generating_further_reducing_mtx(clusters):
+def generating_further_reducing_mtx(N_atoms, clusters_full, clusters):
+    '''
+    Generating the Mtx C. It includes 3 parts corresponding to the paper sequentially.
+    '''
     eps = 1e-8
     nb_of_compononts = 0
-    for orbit in clusters:
+    highest_order = 2
+    for orbit in clusters_full:
         nb_of_compononts += np.power(3, orbit[0].size)
-    #C = np.eye()
-    for orbit in clusters:
+        if orbit[0].size > highest_order:
+            highest_order = orbit[0].size
+    C = np.eye(nb_of_compononts)
+    for orbit in clusters_full:
+        #print(clusters_full.index(orbit)) #The sympy.nullspace is too slow!!!
         B_list = []
         if orbit[0].proper == False:
             block = generating_improper_cluster_constraint(orbit[0].index)
-            B = np.zeros([np.power(3, orbit[0].size), nb_of_compononts+1])
-            B[:, position_in_clusters(orbit[0], clusters):position_in_clusters(orbit[0], clusters)+np.power(3, orbit[0].size)] = block
+            B = np.zeros([np.power(3, orbit[0].size), nb_of_compononts])
+            B[:, position_in_clusters(orbit, clusters_full):position_in_clusters(orbit, clusters_full)+np.power(3, orbit[0].size)] = block
             B_list.append(B)
+        for transed_cluster in orbit[1:]:
+            if cluster_identical(transed_cluster, orbit[0]):
+                block = kron(transed_cluster.point, transed_cluster.size) - np.eye(np.power(3, transed_cluster.size))
+                if not np.max(block) == np.min(block) == 0: 
+                    B = np.zeros([np.power(3, transed_cluster.size), nb_of_compononts])
+                    B[:, position_in_clusters(orbit, clusters_full):position_in_clusters(orbit, clusters_full)+np.power(3, orbit[0].size)] = block
+                    B_list.append(B)
+        for i in B_list:
+            B_C = np.dot(i, C)
+            C_prim = null_space(B_C)
+            C_prim = np.where(abs(C_prim) < eps, 0, C_prim)
+            if np.shape(C_prim)[1] == 0:
+                print('No.%i FCTs vanished !!!' % clusters_full.index(orbit))
+                break
+            else:    
+                C = np.dot(C, C_prim)    
+    ''' Above is first two constraints '''
+    X = []
+    for order in range(2, highest_order+1):
+        for atom in range(N_atoms):
+            B = np.zeros([np.power(3,order), nb_of_compononts])
+            Y = []
+            for orbit in clusters:
+                if orbit[0].size == order:
+                    block = np.zeros([np.power(3,order), np.power(3,order)])
+                    for cluster in orbit[1:]:
+                        if atom in cluster.index:
+                            Y.append(cluster.index)
+                            
+                            n = cluster.index.index(atom)
+                            R = gen_clus_component_repermutation_mtx(cluster.index, n)
+                            Gamma = kron(cluster.point, cluster.size)
+                            block += np.dot(R, Gamma)
+                    B[:, position_in_clusters(orbit, clusters):position_in_clusters(orbit, clusters)+np.power(3,order)] = block
+            '''Got B for tensors of the same order'''
+            X.append(Y)
+            B_C = np.dot(B, C)
+            C_prim = null_space(B_C)
+            C_prim = np.where(abs(C_prim) < eps, 0, C_prim)
+            if np.shape(C_prim)[1] == 0:
+                print('FCT vanished!!! Order: %i  ATOM: %i' %(order, atom))
+                break
+            else:    
+                C = np.dot(C, C_prim)     
+    return C
+            
+
             
 
 
@@ -505,63 +586,17 @@ class Sym_mtx_constrain:
         return A
             
 
+if __name__ == '__main__':
+    clusters = clusters_from_file('log3')
+    clusters_full = clusters_from_file('clusters_symops_full.out')
+    N_atoms=64
+    
 
 
+
+'''
 eps = 1e-8
-
-'''这个是ATAT产生的NaCl'''
-'''
-r = np.zeros([6,3,3])
-
-r[0] = np.array([[0, 0, 1], [0, 1, 0], [1, 0, 0]])
-
-r[1] = np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]])
-
-r[2] = np.array([[0, 1, 0], [0, 0, 1], [1, 0, 0]])
-
-r[3] = np.array([[1, 0, 0], [0, 0, 1], [0, 1, 0]])
-
-r[4] = np.array([[0, 1, 0], [1, 0, 0], [0, 0, 1]])
-
-r[5] = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
-
-G = []
-for i in range(6):
-    temp = np.kron(r[i], r[i])
-    n = temp.shape[0]
-    eye = np.eye(n)
-    G.append(temp - eye)
-'''   
- 
-
 order = 2
-   
-'''这个是晶体对称性网站上 m -3 m的generators'''
-
-'''
-r_1 = np.zeros([5,3,3])
-r_1[0] = np.array([[-1, 0, 0], 
-                   [0, -1, 0], 
-                   [0, 0, 1]])
-    
-r_1[1] = np.array([[-1, 0, 0], 
-                   [0, 1, 0], 
-                   [0, 0, -1]])
-
-r_1[2] = np.array([[0, 0, 1], 
-                   [1, 0, 0], 
-                   [0, 1, 0]])
-
-r_1[3] = np.array([[0, 1, 0], 
-                   [1, 0, 0], 
-                   [0, 0, -1]])
-    
-r_1[4] = np.array([[-1, 0, 0], 
-                   [0, -1, 0], 
-                   [0, 0, -1]])
-'''
-
-'''这些是 ATAT 产生的关于NaCl的迷向子群对应的旋转矩阵'''
 r_1 = np.zeros([8,3,3])
 r_1[0] = np.array([[1, 0, 0], 
                    [0, 0, 1], 
@@ -610,23 +645,16 @@ for i in range(np.shape(r_1)[0]):
 S = Sym_mtx_constrain(order)
 G1.append(S.generate())    
 for i in range(np.shape(r_1)[0] + 1):
-    B_C = Matrix(np.dot(G1[i], C1))
-    
-    
-    C_prim = B_C.nullspace()
-    C_prim = np.array(C_prim).T
-    C_prim = C_prim.astype(np.float64)   
-    C_prim = np.where(abs(C_prim) < eps, 0, C_prim)
-    if np.shape(C_prim) == (0,):
+    B_C = np.dot(G1[i], C1)
+    C_prim = null_space(B_C)
+    #C_prim = np.array(C_prim).T
+    #C_prim = C_prim.astype(np.float64)   
+    #C_prim = np.where(abs(C_prim) < eps, 0, C_prim)
+    if np.shape(C_prim)[1] == 0:
         print('This kind of FCTs do not exist!!!')
         break
     else:    
         C1 = np.dot(C1, C_prim)
-   
-
-
-'''这个是晶体对称性网站上 4 -3 m的generators'''
-
 
 r_1 = np.zeros([4,3,3])
 r_1[0] = np.array([[-1, 0, 0], 
@@ -677,7 +705,71 @@ for i in range(np.shape(r_1)[0] + 1):
         print('This kind of FCTs do not exist!!!')
         break
     else:    
-        C2 = np.dot(C2, C_prim)
+        C2 = np.dot(C2, C_prim)        
+
+'''
+        
+'''这个是ATAT产生的NaCl'''
+'''
+r = np.zeros([6,3,3])
+
+r[0] = np.array([[0, 0, 1], [0, 1, 0], [1, 0, 0]])
+
+r[1] = np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]])
+
+r[2] = np.array([[0, 1, 0], [0, 0, 1], [1, 0, 0]])
+
+r[3] = np.array([[1, 0, 0], [0, 0, 1], [0, 1, 0]])
+
+r[4] = np.array([[0, 1, 0], [1, 0, 0], [0, 0, 1]])
+
+r[5] = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
+
+G = []
+for i in range(6):
+    temp = np.kron(r[i], r[i])
+    n = temp.shape[0]
+    eye = np.eye(n)
+    G.append(temp - eye)
+'''   
+ 
+
+
+   
+'''这个是晶体对称性网站上 m -3 m的generators'''
+
+'''
+r_1 = np.zeros([5,3,3])
+r_1[0] = np.array([[-1, 0, 0], 
+                   [0, -1, 0], 
+                   [0, 0, 1]])
+    
+r_1[1] = np.array([[-1, 0, 0], 
+                   [0, 1, 0], 
+                   [0, 0, -1]])
+
+r_1[2] = np.array([[0, 0, 1], 
+                   [1, 0, 0], 
+                   [0, 1, 0]])
+
+r_1[3] = np.array([[0, 1, 0], 
+                   [1, 0, 0], 
+                   [0, 0, -1]])
+    
+r_1[4] = np.array([[-1, 0, 0], 
+                   [0, -1, 0], 
+                   [0, 0, -1]])
+'''
+
+'''这些是 ATAT 产生的关于NaCl的迷向子群对应的旋转矩阵'''
+
+   
+
+
+'''这个是晶体对称性网站上 4 -3 m的generators'''
+
+
+
     
 
 '''

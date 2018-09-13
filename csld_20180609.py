@@ -15,6 +15,19 @@ from scipy.linalg import null_space
 import os
 import copy
 import itertools
+import sys
+import time
+from sklearn.linear_model import LassoCV, LassoLarsCV, LassoLarsIC
+try:
+    from lxml import etree as ElementTree
+    xmllib="lxml.etree"
+except ImportError:
+    try:
+        import xml.etree.cElementTree as ElementTree
+        xmllib="cElementTree"
+    except ImportError:
+        import xml.etree.ElementTree as ElementTree
+        xmllib="ElementTree"
 
 
 try:
@@ -114,9 +127,35 @@ def move_atoms(poscar):
     #nruter['u_0'] = np.max(displist[1:])
     return (nruter)
 
+def read_forces(filename):
+    """
+    Read a set of forces on atoms from filename, presumably in
+    vasprun.xml format.
+    """
+    calculation=ElementTree.parse(filename
+                                  ).getroot().find("calculation")
+    print ("read file"), filename
+    for a in calculation.findall("varray"):
+        if a.attrib["name"]=="forces":
+            break
+    nruter=[]
+    for i in a.getchildren():
+        nruter.append([float(j) for j in i.text.split()])
+    nruter=np.array(nruter,dtype=np.double)
+    print ("read line"), nruter
+    return nruter
 
-
-
+def gen_F(forces):
+    '''
+    Transform the forces list into a (3*Ntot*L, 1) array
+    '''
+    L = len(forces)
+    F = np.array([0.])
+    for i in range(L):
+        temp = np.reshape(forces[i],(np.size(forces[i]),1),order='C')
+        F = np.vstack((F,temp))
+    F = np.ravel(F[1:])
+    return(F)
 
 def nullspace(A, atol=1e-13, rtol=0):
     A = np.atleast_2d(A)
@@ -253,6 +292,7 @@ def normalize_sensing_mtx(A, clusters):
             temp.append(i)
         else:
             continue
+    order_seperation = temp
     #highest_order = len(temp) + 1
     max_list = []
     for i in range(len(temp)):
@@ -276,9 +316,30 @@ def normalize_sensing_mtx(A, clusters):
         B[:, start_column:end_column] = B[:, start_column:end_column] / u_0
         max_list.append(u_0)
         
-    return B, max_list
+    return B, [order_seperation, max_list]
     
-
+def re_normalize_Phi(Phi, max_list):
+    assert len(max_list[0]) == len(max_list[1])
+    temp = max_list[0]
+    for i in range(len(temp)):
+        if i == 0:
+            start_column = 0
+            end_column = (temp[i+1]-temp[i])*3**(i+2)
+               
+        if i == len(temp) - 1:
+            start_column = 0
+            for j in range(len(temp[:i])):
+                start_column += (temp[j+1]-temp[j])*3**(j+2)
+            end_column = len(Phi)
+        else:
+            start_column = 0
+            for j in range(len(temp[:i])):
+                start_column += (temp[j+1]-temp[j])*3**(j+2)
+            end_column = start_column + (temp[i+1]-temp[i])*3**(i+2)
+        #print(start_column, end_column)    
+        Phi[start_column:end_column] = Phi[start_column:end_column] / max_list[1][i]
+    
+    return Phi
     
 def componont_equal_by_sym(a, b, index):
     '''
@@ -355,6 +416,48 @@ def gen_clus_component_repermutation_mtx(index, n):
     return R
         
         
+def these_atom_in_clus(atoms_list, index):
+    index_copy = copy.deepcopy(index)
+    for i in atoms_list:
+        try:
+            index_copy.remove(i)
+        except ValueError:
+            return False
+    return True
+
+def gen_further_clus_component_repermutation_mtx(atoms_list, index):
+    '''
+    This part is for my updated knowledge of ASR
+    if atoms_list = [a,b,c], index = [b,x,c,a]
+    This function returns a matrix R satisfying R \Phi(x,b,c,a) = \Phi(x,a,b,c)
+    '''
+    size = len(index)
+    R = np.zeros([np.power(3, size), np.power(3, size)])
+    index_copy = copy.deepcopy(index)
+    index_transformed = copy.deepcopy(index)
+    for i in atoms_list:
+        index_copy.remove(i)
+    n = index.index(index_copy[0])
+    index_transformed[0] = index_copy[0]
+    index_transformed[1:] = atoms_list
+    tuple_list = []
+    tuple_list_transformed = []
+    for ind, item in enumerate(itertools.product(['x', 'y', 'z'], repeat=size)):
+        temp = []
+        temp1 = []
+        for i in range(len(item)):
+            temp.append((index[i], item[i]))
+            temp1.append((index_transformed[i], item[i]))
+        tuple_list.append(temp)
+        tuple_list_transformed.append(temp1)
+    for row in range(np.power(3, size)):
+        for i,j in enumerate(tuple_list):
+            if set(j) == set(tuple_list_transformed[row]):
+                R[row, i] = 1
+                break
+    return R
+                
+
 
 def generating_further_reducing_mtx(N_atoms, clusters_full, clusters):
     '''
@@ -392,34 +495,65 @@ def generating_further_reducing_mtx(N_atoms, clusters_full, clusters):
                 break
             else:    
                 C = np.dot(C, C_prim)    
-    ''' Above is first two constraints '''
-    X = []
-    for order in range(2, highest_order+1):
-        for atom in range(N_atoms):
+#    ''' Above is first two constraints '''
+#    '''
+#    X = []
+#    for order in range(2, highest_order+1):
+#        for atom in range(N_atoms):
+#            B = np.zeros([np.power(3,order), nb_of_compononts])
+#            Y = []
+#            for orbit in clusters:
+#                if orbit[0].size == order:
+#                    block = np.zeros([np.power(3,order), np.power(3,order)])
+#                    for cluster in orbit[1:]:
+#                        if atom in cluster.index:
+#                            Y.append(cluster.index)
+#                            
+#                            n = cluster.index.index(atom)
+#                            R = gen_clus_component_repermutation_mtx(cluster.index, n)
+#                            Gamma = kron(cluster.point, cluster.size)
+#                            block += np.dot(R, Gamma)
+#                    B[:, position_in_clusters(orbit, clusters):position_in_clusters(orbit, clusters)+np.power(3,order)] = block
+#    '''   
+#            '''Got B for tensors of the same order'''
+#            '''
+#            X.append(Y)
+#            B_C = np.dot(B, C)
+#            C_prim = null_space(B_C)
+#            C_prim = np.where(abs(C_prim) < eps, 0, C_prim)
+#            if np.shape(C_prim)[1] == 0:
+#                print('FCT vanished!!! Order: %i  ATOM: %i' %(order, atom))
+#                break
+#            else:    
+#                C = np.dot(C, C_prim)  
+#            '''
+    #X = []
+    #for order in range(2, highest_order+1):
+    for order in range(2, 3): 
+    # Only applying ASR on 2-order clusters.
+        for ind, atoms_list in enumerate(itertools.combinations_with_replacement(range(N_atoms), order-1)):
             B = np.zeros([np.power(3,order), nb_of_compononts])
-            Y = []
+            #Y = []
             for orbit in clusters:
                 if orbit[0].size == order:
                     block = np.zeros([np.power(3,order), np.power(3,order)])
                     for cluster in orbit[1:]:
-                        if atom in cluster.index:
-                            Y.append(cluster.index)
-                            
-                            n = cluster.index.index(atom)
-                            R = gen_clus_component_repermutation_mtx(cluster.index, n)
+                        if these_atom_in_clus(atoms_list, cluster.index):
+                            #Y.append(cluster.index)
+                            R = gen_further_clus_component_repermutation_mtx(atoms_list, cluster.index)
                             Gamma = kron(cluster.point, cluster.size)
                             block += np.dot(R, Gamma)
-                    B[:, position_in_clusters(orbit, clusters):position_in_clusters(orbit, clusters)+np.power(3,order)] = block
-            '''Got B for tensors of the same order'''
-            X.append(Y)
+                    B[:, position_in_clusters(orbit, clusters):position_in_clusters(orbit, clusters)+np.power(3,order)] = block                
+            #X.append(Y)
             B_C = np.dot(B, C)
             C_prim = null_space(B_C)
             C_prim = np.where(abs(C_prim) < eps, 0, C_prim)
             if np.shape(C_prim)[1] == 0:
-                print('FCT vanished!!! Order: %i  ATOM: %i' %(order, atom))
+                print('FCT vanished!!! Order: %i  ATOMS_LIST: ' %(order), atoms_list)
                 break
             else:    
-                C = np.dot(C, C_prim)     
+                C = np.dot(C, C_prim)                    
+
     return C
             
 
@@ -462,6 +596,31 @@ def clusters_from_file(filename):
             clusters.append(orbit)
     return clusters
                 
+def write_2nd(Phi, N_atoms, clusters, filename):
+    pairs_list = list(itertools.product(range(1,N_atoms+1), repeat=2))
+    dic = {}
+    for key in pairs_list:
+        dic[key] = np.zeros([9,1])
+    for orbit in clusters:
+        if orbit[0].size == 2:
+            for cluster in orbit[1:]:
+                key = tuple([i+1 for i in cluster.index])
+                Gamma = kron(cluster.point, cluster.size)
+                Phi_part = Phi[position_in_clusters(orbit, clusters):position_in_clusters(orbit, clusters)+np.power(3,cluster.size)]
+                dic[key] = np.dot(Gamma, Phi_part)
+                if (key[0] != key[1]):
+                    reverse_key = tuple([key[1],key[0]])
+                    dic[reverse_key] = np.dot(gen_clus_component_repermutation_mtx(key, 1), dic[key])
+    f = open(filename, "w")
+    f.write("{:>5}\n".format(N_atoms))
+    for key in dic:
+        f.write('%5d%5d\n' % (key[0], key[1]))
+        f.write('%25.15f%25.15f%25.15f\n'%(dic[key][0],dic[key][1],dic[key][2]))
+        f.write('%25.15f%25.15f%25.15f\n'%(dic[key][3],dic[key][4],dic[key][5]))
+        f.write('%25.15f%25.15f%25.15f\n'%(dic[key][6],dic[key][7],dic[key][8]))
+    f.close()
+        
+
                 
                 
 
@@ -587,211 +746,86 @@ class Sym_mtx_constrain:
             
 
 if __name__ == '__main__':
+    poscar = read_POSCAR()
     clusters = clusters_from_file('log3')
     clusters_full = clusters_from_file('clusters_symops_full.out')
-    N_atoms=64
+    N_atoms = len(poscar["types"])
+    C = generating_further_reducing_mtx(N_atoms, clusters_full, clusters)
+    namepattern="CSLD.POSCAR.{{0:0{0}d}}".format(3)
+    L = 2 # Number of configurations.
     
-
-
-
-'''
-eps = 1e-8
-order = 2
-r_1 = np.zeros([8,3,3])
-r_1[0] = np.array([[1, 0, 0], 
-                   [0, 0, 1], 
-                   [0, 1, 0]])
-    
-r_1[1] = np.array([[1, 0, 0], 
-                   [0, 1, 0], 
-                   [0, 0, 1]])
-
-r_1[2] = np.array([[-1, 0, 0], 
-                   [0, 0, 1], 
-                   [0, 1, 0]])
-
-r_1[3] = np.array([[0, -1, 0], 
-                   [0, 0, 1], 
-                   [-1, 0, 0]])
-    
-r_1[4] = np.array([[0, -1, 0], 
-                   [-1, 0, 0], 
-                   [0, 0, 1]]) 
-    
-r_1[5] = np.array([[-1, 0, 0], 
-                   [0, 1, 0], 
-                   [0, 0, 1]])   
-    
-r_1[6] = np.array([[0, 0, -1], 
-                   [-1, 0, 0], 
-                   [0, 1, 0]])
-
-r_1[7] = np.array([[0, 0, -1], 
-                   [0, 1, 0], 
-                   [-1, 0, 0]])     
-    
-
-       
-G1 = []
-n = np.power(3, order)
-C1 = np.eye(n)
-for i in range(np.shape(r_1)[0]):
-    temp = kron(r_1[i], order)
-    #n = temp.shape[0]
-    eye = np.eye(n)
-    B = temp - eye
-    G1.append(B)
-
-S = Sym_mtx_constrain(order)
-G1.append(S.generate())    
-for i in range(np.shape(r_1)[0] + 1):
-    B_C = np.dot(G1[i], C1)
-    C_prim = null_space(B_C)
-    #C_prim = np.array(C_prim).T
-    #C_prim = C_prim.astype(np.float64)   
-    #C_prim = np.where(abs(C_prim) < eps, 0, C_prim)
-    if np.shape(C_prim)[1] == 0:
-        print('This kind of FCTs do not exist!!!')
-        break
-    else:    
-        C1 = np.dot(C1, C_prim)
-
-r_1 = np.zeros([4,3,3])
-r_1[0] = np.array([[-1, 0, 0], 
-                   [0, -1, 0], 
-                   [0, 0, 1]])
-    
-r_1[1] = np.array([[-1, 0, 0], 
-                   [0, 1, 0], 
-                   [0, 0, -1]])
-
-r_1[2] = np.array([[0, 0, 1], 
-                   [1, 0, 0], 
-                   [0, 1, 0]])
-
-r_1[3] = np.array([[0, 1, 0], 
-                   [1, 0, 0], 
-                   [0, 0, 1]])
-    
-
-G2 = []
-
-#see = []
-#cprim = []
-
-n = np.power(3, order)
-C2 = np.eye(n)
-for i in range(np.shape(r_1)[0]):
-    temp = kron(r_1[i], order)
-    #n = temp.shape[0]
-    eye = np.eye(n)
-    B = temp - eye
-    G2.append(B)
- 
-S = Sym_mtx_constrain(order)
-G2.append(S.generate())        
-for i in range(np.shape(r_1)[0] + 1):    
-    B_C = Matrix(np.dot(G2[i], C2))
-    C_prim = B_C.nullspace()
-    C_prim = np.array(C_prim).T
-    C_prim = C_prim.astype(np.float64)   
-    
-    #cprim.append([C_prim])
-    
-    C_prim = np.where(abs(C_prim) < eps, 0, C_prim)
-    
-    #see.append([C2])
-    if np.shape(C_prim) == (0,):
-        print('This kind of FCTs do not exist!!!')
-        break
-    else:    
-        C2 = np.dot(C2, C_prim)        
-
-'''
+    A_parts = []
+    for i in range(L):
+        new_poscar = move_atoms(poscar)
+        filename = namepattern.format(i+1)
+        write_POSCAR(new_poscar,filename)
+        A_prim_part = generating_sensing_mtx(N_atoms, clusters, new_poscar)
+        #A_prim, max_list = normalize_sensing_mtx(A_prim, clusters)
         
-'''这个是ATAT产生的NaCl'''
-'''
-r = np.zeros([6,3,3])
-
-r[0] = np.array([[0, 0, 1], [0, 1, 0], [1, 0, 0]])
-
-r[1] = np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]])
-
-r[2] = np.array([[0, 1, 0], [0, 0, 1], [1, 0, 0]])
-
-r[3] = np.array([[1, 0, 0], [0, 0, 1], [0, 1, 0]])
-
-r[4] = np.array([[0, 1, 0], [1, 0, 0], [0, 0, 1]])
-
-r[5] = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
-
-G = []
-for i in range(6):
-    temp = np.kron(r[i], r[i])
-    n = temp.shape[0]
-    eye = np.eye(n)
-    G.append(temp - eye)
-'''   
- 
-
-
-   
-'''这个是晶体对称性网站上 m -3 m的generators'''
-
-'''
-r_1 = np.zeros([5,3,3])
-r_1[0] = np.array([[-1, 0, 0], 
-                   [0, -1, 0], 
-                   [0, 0, 1]])
+        #A = np.dot(A_prim, C)
+        A_parts.append(A_prim_part)
+        
+    A_parts = tuple(A_parts)
+    A_prim = np.vstack(A_parts)
+    A_prim, max_list = normalize_sensing_mtx(A_prim, clusters)
+    A = np.dot(A_prim, C)
     
-r_1[1] = np.array([[-1, 0, 0], 
-                   [0, 1, 0], 
-                   [0, 0, -1]])
-
-r_1[2] = np.array([[0, 0, 1], 
-                   [1, 0, 0], 
-                   [0, 1, 0]])
-
-r_1[3] = np.array([[0, 1, 0], 
-                   [1, 0, 0], 
-                   [0, 0, -1]])
+    np.save("A.npy", A)
+    #np.save('max_list.npy',max_list)
     
-r_1[4] = np.array([[-1, 0, 0], 
-                   [0, -1, 0], 
-                   [0, 0, -1]])
-'''
+    '''
+    Assuming the VASP calculations have been completed...
+    '''
 
-'''这些是 ATAT 产生的关于NaCl的迷向子群对应的旋转矩阵'''
+    '''
+    Read the calculated forces
+    '''
+    filelist = []
+    for fil in os.listdir(os.getcwd()):
+        if 'vasprun.xml_' in fil:
+            filelist.append(fil)
+    filelist.sort()
+    nfiles = len(filelist)    
+    print ("- {0} vaspruns read".format(nfiles))  
+    if nfiles != L:
+        sys.exit("Error: {0} filenames were expected".format(L))
+    for i in filelist:
+        if not os.path.isfile(i):
+            sys.exit("Error: {0} is not a regular file".format(i))
+    print ("Reading the forces")
+    forces = []
+    for i in filelist:
+        forces.append(read_forces(i))
+        print ("- {0} read successfully".format(i))
+        res=forces[-1].mean(axis=0)
+        print ("- \t Average force:")
+        print ("- \t {0} eV/(A * atom)".format(res))
+    F = gen_F(forces)
+    np.save('F.npy',F)
 
-   
-
-
-'''这个是晶体对称性网站上 4 -3 m的generators'''
-
-
-
+    '''
+    Training with LASSO_CV
+    These have been tranfered to another file.
+    '''
+    '''
+    A = np.load('A.npy')
+    F = np.load('F.npy')
+    alphas = [0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5]
+    print("Computing regularization path using the coordinate descent lasso...")
+    t1 = time.time()
+    model = LassoCV(fit_intercept=False,alphas=alphas,precompute='auto',selection='random',n_jobs = 1).fit(A, F)
+    t_lasso_cv = time.time() - t1
+    Phi_reduced = model.coef_
+    np.save("Phi_reduced.npy",model.coef_)
     
-
-'''
-l = []
-for i in range(3):
-    if i==0: t1 ='x'
-    elif i==1: t1='y'
-    elif i==2: t1='z'
-    for j in range(3):
-        if j==0: t2 ='x'
-        elif j==1: t2='y'
-        elif j==2: t2='z'
-        for k in range(3):
-            if k==0: t3 ='x'
-            elif k==1: t3='y'
-            elif k==2: t3='z'
-            for m in range(3):
-                if m==0: t4 ='x'
-                elif m==1: t4='y'
-                elif m==2: t4='z'
-                str0 = t1+t2+t3+t4
-                l.append(str0)
-'''
+    print('None-zero terms: ', np.sum(Phi_reduced!=0))
+    print('N_iter: ',model.n_iter_)
+    '''
+    
+    Phi_reduced = np.load('Phi_reduced.npy')
+    Phi = np.dot(C, Phi_reduced)
+    #max_list = np.load('max_list.npy')
+    Phi = re_normalize_Phi(Phi, max_list)
+    write_2nd(Phi, N_atoms, clusters, 'FORCE_CONSTANTS')
 
      

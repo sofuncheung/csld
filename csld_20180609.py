@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import scipy as sp
 import scipy.linalg
+import spglib as spg
 from sympy import Matrix
 from numpy.linalg import svd
 from scipy.linalg import null_space
@@ -127,6 +128,26 @@ def move_atoms(poscar):
     #nruter['u_0'] = np.max(displist[1:])
     return (nruter)
 
+def move_atoms_simple(poscar):
+    '''
+    Concerns no random displacement, all displacements have length of 0.01 \AA.
+    just random directions of these displacements.
+    '''
+    nruter=copy.deepcopy(poscar)
+    displist = []
+    ntot = nruter["positions"].shape[1]
+    for iat in range(ntot):
+        disp = np.array([0.01 * random_sign(), 0.01 * random_sign(), 0.01 * random_sign()]) 
+        displist.append(disp)
+        nruter["positions"][:,iat]+=scipy.linalg.solve(nruter["lattvec"],
+                                                       disp)
+    nruter['displist'] = np.array(displist)
+    return (nruter)
+    
+    
+    
+    
+
 def read_forces(filename):
     """
     Read a set of forces on atoms from filename, presumably in
@@ -235,7 +256,7 @@ def cluster_factorial(cluster):
             
 def cluster_identical(cluster_a, cluster_b):
     '''
-    Return whether two clusters are identical.
+    Return whether two clusters are identical, regardless of permutation.
     '''
     a = copy.deepcopy(cluster_a.index)
     b = copy.deepcopy(cluster_b.index)
@@ -260,13 +281,15 @@ def generating_sensing_mtx(N_atoms, clusters, poscar):
     A = -1 * np.ones([3 * N_atoms, 1])
     for orbit in clusters:
         sensing_mtx_block = np.zeros([3 * N_atoms, np.power(3, orbit[0].size)])
-        temp_block = np.zeros([3 * N_atoms, np.power(3, orbit[0].size)])
+        #temp_block = np.zeros([3 * N_atoms, np.power(3, orbit[0].size)])
         for cluster in orbit:
             is_rep = cluster.is_rep
             if not(is_rep):
                 #for i in sorted(set(cluster.index),key=cluster.index.index) :# repeat atoms only need to be considered once.
                 #    order = cluster.index.count(i)
                 #    temp_block[3 * i, ] = -1./cluster_factorial(cluster)*
+                if cluster.is_correct_relative_position == False: continue
+                temp_block = np.zeros([3 * N_atoms, np.power(3, orbit[0].size)])
                 for index, item in enumerate(itertools.product(['x', 'y', 'z'], repeat=orbit[0].size)):
                     tuple_list = []
                     for i in range(len(item)):
@@ -284,6 +307,44 @@ def generating_sensing_mtx(N_atoms, clusters, poscar):
         A = np.hstack((A, sensing_mtx_block))
     return A[:,1:]
 
+def gen_sensing_mtx_original(N_atoms, clusters, poscar):
+    '''
+    To double check the sensing_mtx has been correctly generated.
+    '''
+    len_of_Phi = 0
+    for i in clusters:
+        len_of_Phi += np.power(3, i[0].size)
+    sensing_mtx = np.zeros([3*N_atoms, len_of_Phi])
+    for atom in range(N_atoms):
+        for orbit in clusters:
+            for cluster in orbit[1:]:
+                if cluster.is_correct_relative_position == False: continue
+                if atom in cluster.index:
+                    temp_block = np.zeros([3, np.power(3,cluster.size)])
+                    _list = []
+                    for index, item in enumerate(itertools.product(['x', 'y', 'z'], repeat=cluster.size)):
+                        tuple_list = []
+                        for i in range(len(item)):
+                            tuple_list.append((cluster.index[i], item[i]))
+                        _list.append(tuple_list)
+                    for tuple_list in _list:
+                        for _tuple in tuple_list:
+                            if _tuple[0] == atom:
+                                order = tuple_list.count(_tuple)
+                                _position = _list.index(tuple_list)
+                                if _tuple[1] == 'x':
+                                    temp_block[0, _position] = order * displacements_product(tuple_list, _tuple, poscar)
+                                if _tuple[1] == 'y':
+                                    temp_block[1, _position] = order * displacements_product(tuple_list, _tuple, poscar)
+                                if _tuple[1] == 'z':
+                                    temp_block[2, _position] = order * displacements_product(tuple_list, _tuple, poscar)
+                    
+                    temp_block = np.dot(temp_block, kron(cluster.point, cluster.size))* (-1. / cluster_factorial(cluster))   
+                    sensing_mtx[3*atom:3*atom+3,position_in_clusters(orbit, clusters):
+                            position_in_clusters(orbit, clusters)+np.power(3,cluster.size)] += temp_block
+                            
+    return sensing_mtx
+        
 def normalize_sensing_mtx(A, clusters):
     B = copy.deepcopy(A)
     temp = [0]
@@ -296,20 +357,24 @@ def normalize_sensing_mtx(A, clusters):
     #highest_order = len(temp) + 1
     max_list = []
     for i in range(len(temp)):
-        if i == 0:
-            start_column = 0
-            end_column = (temp[i+1]-temp[i])*3**(i+2)
-               
-        if i == len(temp) - 1:
-            start_column = 0
-            for j in range(len(temp[:i])):
-                start_column += (temp[j+1]-temp[j])*3**(j+2)
-            end_column = B.shape[1]
+        if len(temp) > 1:
+            if i == 0:
+                start_column = 0
+                end_column = (temp[i+1]-temp[i])*3**(i+2)
+                   
+            if i == len(temp) - 1:
+                start_column = 0
+                for j in range(len(temp[:i])):
+                    start_column += (temp[j+1]-temp[j])*3**(j+2)
+                end_column = B.shape[1]
+            else:
+                start_column = 0
+                for j in range(len(temp[:i])):
+                    start_column += (temp[j+1]-temp[j])*3**(j+2)
+                end_column = start_column + (temp[i+1]-temp[i])*3**(i+2)
         else:
             start_column = 0
-            for j in range(len(temp[:i])):
-                start_column += (temp[j+1]-temp[j])*3**(j+2)
-            end_column = start_column + (temp[i+1]-temp[i])*3**(i+2)
+            end_column = B.shape[1]
             
         #print(start_column, end_column)
         u_0 = np.max(abs(B[:, start_column:end_column]))
@@ -322,20 +387,24 @@ def re_normalize_Phi(Phi, max_list):
     assert len(max_list[0]) == len(max_list[1])
     temp = max_list[0]
     for i in range(len(temp)):
-        if i == 0:
-            start_column = 0
-            end_column = (temp[i+1]-temp[i])*3**(i+2)
-               
-        if i == len(temp) - 1:
-            start_column = 0
-            for j in range(len(temp[:i])):
-                start_column += (temp[j+1]-temp[j])*3**(j+2)
-            end_column = len(Phi)
+        if len(temp) > 1:
+            if i == 0:
+                start_column = 0
+                end_column = (temp[i+1]-temp[i])*3**(i+2)
+                   
+            if i == len(temp) - 1:
+                start_column = 0
+                for j in range(len(temp[:i])):
+                    start_column += (temp[j+1]-temp[j])*3**(j+2)
+                end_column = len(Phi)
+            else:
+                start_column = 0
+                for j in range(len(temp[:i])):
+                    start_column += (temp[j+1]-temp[j])*3**(j+2)
+                end_column = start_column + (temp[i+1]-temp[i])*3**(i+2)
         else:
             start_column = 0
-            for j in range(len(temp[:i])):
-                start_column += (temp[j+1]-temp[j])*3**(j+2)
-            end_column = start_column + (temp[i+1]-temp[i])*3**(i+2)
+            end_column = len(Phi)
         #print(start_column, end_column)    
         Phi[start_column:end_column] = Phi[start_column:end_column] / max_list[1][i]
     
@@ -457,8 +526,31 @@ def gen_further_clus_component_repermutation_mtx(atoms_list, index):
                 break
     return R
                 
-
-
+def gen_ultimate_clus_component_repermutation_mtx(index_org, index_tran):
+    '''
+    This part is for the 2nd "isotropy group symmetry" convinience.
+    Return R satisfying R \Phi(index_org) = \Phi(index_tran)
+    The index_org may like (a,b,c,...), and index_tran may like (c,a,b,...)
+    '''
+    size = len(index_org)
+    R = np.zeros([np.power(3, size), np.power(3, size)])
+    tuple_list = []
+    tuple_list_transformed = []
+    for ind, item in enumerate(itertools.product(['x', 'y', 'z'], repeat=size)):
+        temp = []
+        temp1 = []
+        for i in range(len(item)):
+            temp.append((index_org[i], item[i]))
+            temp1.append((index_tran[i], item[i]))
+        tuple_list.append(temp)
+        tuple_list_transformed.append(temp1)
+    for row in range(np.power(3, size)):
+        for i,j in enumerate(tuple_list):
+            if set(j) == set(tuple_list_transformed[row]):
+                R[row, i] = 1
+                break
+    return R
+            
 def generating_further_reducing_mtx(N_atoms, clusters_full, clusters):
     '''
     Generating the Mtx C. It includes 3 parts corresponding to the paper sequentially.
@@ -474,26 +566,37 @@ def generating_further_reducing_mtx(N_atoms, clusters_full, clusters):
     for orbit in clusters_full:
         #print(clusters_full.index(orbit)) #The sympy.nullspace is too slow!!!
         B_list = []
+        block_list = []
         if orbit[0].proper == False:
             block = generating_improper_cluster_constraint(orbit[0].index)
+            block_list.append(block)
             B = np.zeros([np.power(3, orbit[0].size), nb_of_compononts])
             B[:, position_in_clusters(orbit, clusters_full):position_in_clusters(orbit, clusters_full)+np.power(3, orbit[0].size)] = block
             B_list.append(B)
+           
         for transed_cluster in orbit[1:]:
+            if transed_cluster.is_correct_relative_position == False: continue
             if cluster_identical(transed_cluster, orbit[0]):
-                block = kron(transed_cluster.point, transed_cluster.size) - np.eye(np.power(3, transed_cluster.size))
+            #if transed_cluster.index == orbit[0].index:
+                #print(transed_cluster.index, orbit[0].index)
+                R = gen_ultimate_clus_component_repermutation_mtx(orbit[0].index, transed_cluster.index)
+                block = kron(transed_cluster.point, transed_cluster.size) - R
                 if not np.max(block) == np.min(block) == 0: 
+                    block_list.append(block)
                     B = np.zeros([np.power(3, transed_cluster.size), nb_of_compononts])
                     B[:, position_in_clusters(orbit, clusters_full):position_in_clusters(orbit, clusters_full)+np.power(3, orbit[0].size)] = block
                     B_list.append(B)
+                   
         for i in B_list:
             B_C = np.dot(i, C)
+            B_C = np.where(abs(B_C) < eps, 0, B_C) # This is vital!!!
             C_prim = null_space(B_C)
             C_prim = np.where(abs(C_prim) < eps, 0, C_prim)
+            
             if np.shape(C_prim)[1] == 0:
                 print('No.%i FCTs vanished !!!' % clusters_full.index(orbit))
                 break
-            else:    
+            else:
                 C = np.dot(C, C_prim)    
 #    ''' Above is first two constraints '''
 #    '''
@@ -527,25 +630,31 @@ def generating_further_reducing_mtx(N_atoms, clusters_full, clusters):
 #            else:    
 #                C = np.dot(C, C_prim)  
 #            '''
-    #X = []
-    #for order in range(2, highest_order+1):
-    for order in range(2, 3): 
+    X = []
+    for order in range(2, highest_order+1):
+    #for order in range(2, 3): 
     # Only applying ASR on 2-order clusters.
         for ind, atoms_list in enumerate(itertools.combinations_with_replacement(range(N_atoms), order-1)):
             B = np.zeros([np.power(3,order), nb_of_compononts])
-            #Y = []
+            #checked_list = []
+            Y = []
             for orbit in clusters:
                 if orbit[0].size == order:
                     block = np.zeros([np.power(3,order), np.power(3,order)])
                     for cluster in orbit[1:]:
                         if these_atom_in_clus(atoms_list, cluster.index):
-                            #Y.append(cluster.index)
+                            if cluster.is_correct_relative_position == False: continue
+                            #if cluster_checked(cluster, checked_list): continue
+                            Y.append(cluster.index)
+                            #checked_list.append(cluster)
                             R = gen_further_clus_component_repermutation_mtx(atoms_list, cluster.index)
                             Gamma = kron(cluster.point, cluster.size)
                             block += np.dot(R, Gamma)
+                            #break;
                     B[:, position_in_clusters(orbit, clusters):position_in_clusters(orbit, clusters)+np.power(3,order)] = block                
-            #X.append(Y)
+            X.append(Y)
             B_C = np.dot(B, C)
+            B_C = np.where(abs(B_C) < eps, 0, B_C) # This is vital!!!
             C_prim = null_space(B_C)
             C_prim = np.where(abs(C_prim) < eps, 0, C_prim)
             if np.shape(C_prim)[1] == 0:
@@ -555,9 +664,25 @@ def generating_further_reducing_mtx(N_atoms, clusters_full, clusters):
                 C = np.dot(C, C_prim)                    
 
     return C
-            
-
-            
+     
+def cluster_checked(cluster, checked_list):
+    for i in checked_list:
+        if cluster_identical(i, cluster):
+            return True
+    return False
+       
+def cluster_in_list(index, list_Y):
+    '''
+    To judge whether a cluster.index is in a list.
+    '''
+    a = copy.deepcopy(index)
+    a.sort()
+    for i in list_Y:
+        b = copy.deepcopy(i)
+        b.sort()
+        if a==b:
+            return True
+    return False
 
 
 
@@ -604,13 +729,14 @@ def write_2nd(Phi, N_atoms, clusters, filename):
     for orbit in clusters:
         if orbit[0].size == 2:
             for cluster in orbit[1:]:
-                key = tuple([i+1 for i in cluster.index])
-                Gamma = kron(cluster.point, cluster.size)
-                Phi_part = Phi[position_in_clusters(orbit, clusters):position_in_clusters(orbit, clusters)+np.power(3,cluster.size)]
-                dic[key] = np.dot(Gamma, Phi_part)
-                if (key[0] != key[1]):
-                    reverse_key = tuple([key[1],key[0]])
-                    dic[reverse_key] = np.dot(gen_clus_component_repermutation_mtx(key, 1), dic[key])
+                if cluster.is_correct_relative_position == True:
+                    key = tuple([i+1 for i in cluster.index])
+                    Gamma = kron(cluster.point, cluster.size)
+                    Phi_part = Phi[position_in_clusters(orbit, clusters):position_in_clusters(orbit, clusters)+np.power(3,cluster.size)]
+                    dic[key] = np.dot(Gamma, Phi_part)
+                    if (key[0] != key[1]):
+                        reverse_key = tuple([key[1],key[0]])
+                        dic[reverse_key] = np.dot(gen_clus_component_repermutation_mtx(key, 1), dic[key])
     f = open(filename, "w")
     f.write("{:>5}\n".format(N_atoms))
     for key in dic:
@@ -648,6 +774,7 @@ class hidden_cluster:
         self.hidden = True
         self.index = index
         self.proper = len(self.index) == len(set(self.index))
+        self.is_correct_relative_position = True
             
     def point_to_nparray(self, point):
         nparray = np.zeros([3, 3])
@@ -684,7 +811,10 @@ class cluster_file_indexing:
         b1 = float(b.split()[0])
         b2 = float(b.split()[1])
         b3 = float(b.split()[2])
-        if (abs(a1-b1)<1e-4 or abs(abs(a1-b1)-self.lattice_para_a)<1e-4) & (abs(a2-b2)<1e-4 or abs(abs(a2-b2)-self.lattice_para_b)<1e-4) & (abs(a3-b3)<1e-4 or abs(abs(a3-b3)-self.lattice_para_c)<1e-4):
+        if ((abs(a1-b1).is_integer() or abs(a1-b1)<1e-4 or abs(abs(a1-b1)-self.lattice_para_a)<1e-4) 
+        & (abs(a2-b2).is_integer() or abs(a2-b2)<1e-4 or abs(abs(a2-b2)-self.lattice_para_b)<1e-4) 
+        & (abs(a3-b3).is_integer() or abs(a3-b3)<1e-4 or abs(abs(a3-b3)-self.lattice_para_c)<1e-4)):
+        #if (abs(a1-b1).is_integer() or abs(abs(a1-b1)-self.lattice_para_a)<1e-4) & (abs(a2-b2).is_integer() or abs(abs(a2-b2)-self.lattice_para_b)<1e-4) & (abs(a3-b3).is_integer() or abs(abs(a3-b3)-self.lattice_para_c)<1e-4):
             return True
         else:	
             return False 
@@ -744,19 +874,100 @@ class Sym_mtx_constrain:
                     break
         return A
             
+def write_spglib_symops(symops, filename):
+    f = open(filename, 'w')
+    N = symops['translations'].shape[0]
+    f.write(str(N))
+    f.write('\n')
+    for i in range(N):
+        f.write("{0[0][0]:4d} {0[0][1]:4d} {0[0][2]:4d} {0[1][0]:4d} {0[1][1]:4d} {0[1][2]:4d} {0[2][0]:4d} {0[2][1]:4d} {0[2][2]:4d}\n".format(symops['rotations'][i].tolist()))
+        f.write("{0[0]:8.6f} {0[1]:8.6f} {0[2]:8.6f}\n".format(symops['translations'][i].tolist()))
+    f.close()
+
+def remain_right_relative_position_clusters(clusters, poscar):
+    clusters_temp = copy.deepcopy(clusters)
+    for orbit in clusters_temp:
+        #checked_list = []
+        for cluster in orbit[1:]:
+            #if cluster in checked_list: continue
+            #same_list = [] #Sometimes only one can be wrong relative position.
+            #for i in orbit[1:]:
+            #    if cluster_identical(i, cluster):
+            #        same_list.append(i)
+            #        checked_list.append(i)
+            #if len(same_list) > 1:
+            #    for k in same_list:
+                    #print(relative_position)
+            if not is_right_relative_position(cluster, poscar):
+                #orbit.remove(k)
+                cluster.is_correct_relative_position = False
+    return clusters_temp
+   
+def is_right_relative_position(cluster, poscar):
+    eps = 1.e-8
+    size = cluster.size
+    #std_relative_position = []
+    #relative_position = []
+    for j in range(size-1):
+        std_relative_position = (poscar['positions'][:,cluster.index[j+1]]-
+                                 poscar['positions'][:,cluster.index[0]])
+        relative_position = (str_to_np_array(cluster.atoms[j+1])-
+                             str_to_np_array(cluster.atoms[0]))
+        if np.linalg.norm(relative_position - std_relative_position) > eps:
+            return False
+    return True
+
+def remove_wrong_relative_position_clusters(clusters):
+    new_clusters = copy.deepcopy(clusters)
+    for orbit in new_clusters:
+        for cluster in orbit[1:]:
+            if cluster.is_correct_relative_position == False:
+                orbit.remove(cluster)
+    return new_clusters
+                    
+def str_to_np_array(s):
+    a = np.zeros(3)
+    a[0] = float(s.split()[0])
+    a[1] = float(s.split()[1])
+    a[2] = float(s.split()[2])
+    return a
+
+
+           
 
 if __name__ == '__main__':
+    '''
+    File needed: POSCAR clusters_reduced.out clusters_symops_full.out lat.in
+    '''
+    eps = 1.e-8
     poscar = read_POSCAR()
-    clusters = clusters_from_file('log3')
+    
+    # Additional part for symmetry from spglib.
+    SYMPREC = 1e-5
+    cell = (poscar["lattvec"],poscar["positions"].T,poscar["types"])
+    symops = spg.get_symmetry(cell,SYMPREC)
+    write_spglib_symops(symops, 'spglib_symops')
+    
+    sys.exit(0)
+    
+    '''
+    Now use corrdump to generate 2 clusters files. 
+    '''
+    
+    clusters = clusters_from_file('clusters_reduced.out')
     clusters_full = clusters_from_file('clusters_symops_full.out')
+    clusters = remain_right_relative_position_clusters(clusters, poscar)
+    clusters_full = remain_right_relative_position_clusters(clusters_full, poscar)
+    
+    
     N_atoms = len(poscar["types"])
     C = generating_further_reducing_mtx(N_atoms, clusters_full, clusters)
     namepattern="CSLD.POSCAR.{{0:0{0}d}}".format(3)
-    L = 2 # Number of configurations.
+    L = 1 # Number of configurations.
     
     A_parts = []
     for i in range(L):
-        new_poscar = move_atoms(poscar)
+        new_poscar = move_atoms_simple(poscar)
         filename = namepattern.format(i+1)
         write_POSCAR(new_poscar,filename)
         A_prim_part = generating_sensing_mtx(N_atoms, clusters, new_poscar)
@@ -776,7 +987,10 @@ if __name__ == '__main__':
     '''
     Assuming the VASP calculations have been completed...
     '''
-
+    
+    sys.exit(0)
+    
+        
     '''
     Read the calculated forces
     '''
@@ -824,8 +1038,10 @@ if __name__ == '__main__':
     
     Phi_reduced = np.load('Phi_reduced.npy')
     Phi = np.dot(C, Phi_reduced)
+    Phi = np.where(abs(Phi) < eps, 0, Phi)
     #max_list = np.load('max_list.npy')
     Phi = re_normalize_Phi(Phi, max_list)
+    Phi = np.where(abs(Phi) < eps, 0, Phi)
     write_2nd(Phi, N_atoms, clusters, 'FORCE_CONSTANTS')
 
      
